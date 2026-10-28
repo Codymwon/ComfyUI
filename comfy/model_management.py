@@ -2206,25 +2206,72 @@ def debug_memory_summary():
 class InterruptProcessingException(BaseException):
     pass
 
+class CancellationManager:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._active_tokens = {}
+        self._current_prompt_id = None
+
+    def set_current_prompt(self, prompt_id):
+        with self._lock:
+            self._current_prompt_id = prompt_id
+
+    def cancel_prompt(self, prompt_id=None):
+        with self._lock:
+            if prompt_id is None:
+                prompt_id = self._current_prompt_id
+            if prompt_id is not None:
+                self._active_tokens[prompt_id] = True
+
+    def register_prompt(self, prompt_id):
+        with self._lock:
+            if not self._active_tokens.get(prompt_id, False):
+                self._active_tokens[prompt_id] = False
+
+    def unregister_prompt(self, prompt_id):
+        with self._lock:
+            self._active_tokens.pop(prompt_id, None)
+            if self._current_prompt_id == prompt_id:
+                self._current_prompt_id = None
+
+    def is_cancelled(self, prompt_id=None):
+        with self._lock:
+            if prompt_id is None:
+                prompt_id = self._current_prompt_id
+            return self._active_tokens.get(prompt_id, False)
+
+cancellation_manager = CancellationManager()
+CANCELLATION_MANAGER = cancellation_manager
+
 interrupt_processing_mutex = threading.RLock()
 
 interrupt_processing = False
-def interrupt_current_processing(value=True):
+def interrupt_current_processing(value=True, prompt_id=None):
     global interrupt_processing
     global interrupt_processing_mutex
+    if prompt_id is not None:
+        if value:
+            cancellation_manager.cancel_prompt(prompt_id)
+        return
     with interrupt_processing_mutex:
         interrupt_processing = value
+    if value:
+        cancellation_manager.cancel_prompt()
 
-def processing_interrupted():
+def processing_interrupted(prompt_id=None):
     global interrupt_processing
     global interrupt_processing_mutex
     with interrupt_processing_mutex:
-        return interrupt_processing
+        if interrupt_processing:
+            return True
+    return cancellation_manager.is_cancelled(prompt_id)
 
-def throw_exception_if_processing_interrupted():
+def throw_exception_if_processing_interrupted(prompt_id=None):
     global interrupt_processing
     global interrupt_processing_mutex
     with interrupt_processing_mutex:
         if interrupt_processing:
             interrupt_processing = False
             raise InterruptProcessingException()
+    if cancellation_manager.is_cancelled(prompt_id):
+        raise InterruptProcessingException()

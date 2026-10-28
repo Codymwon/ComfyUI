@@ -734,6 +734,8 @@ class PromptExecutor:
         set_preview_method(extra_data.get("preview_method"))
 
         nodes.interrupt_processing(False)
+        comfy.model_management.cancellation_manager.register_prompt(prompt_id)
+        comfy.model_management.cancellation_manager.set_current_prompt(prompt_id)
         self.prompt_model_tracker.start()
 
         if "client_id" in extra_data:
@@ -840,6 +842,7 @@ class PromptExecutor:
                 if comfy.model_management.DISABLE_SMART_MEMORY:
                     comfy.model_management.unload_all_models()
         finally:
+            comfy.model_management.cancellation_manager.unregister_prompt(prompt_id)
             if self.cache_type == CacheType.RAM_PRESSURE:
                 detail("RAM cache evictions: prompt=%s active=%s full=%s", prompt_id, self.caches.outputs.active_evictions, self.caches.outputs.full_evictions)
             comfy.memory_management.set_ram_cache_release_state(None, 0)
@@ -1390,7 +1393,7 @@ class PromptQueue:
         with self.mutex:
             for item in self.currently_running.values():
                 if item[1] == prompt_id:
-                    nodes.interrupt_processing()
+                    comfy.model_management.cancellation_manager.cancel_prompt(prompt_id)
                     return True
         return False
 
@@ -1400,6 +1403,8 @@ class PromptQueue:
 
     def wipe_queue(self):
         with self.mutex:
+            for item in self.queue:
+                comfy.model_management.cancellation_manager.unregister_prompt(item[1])
             self.queue = []
             self.server.queue_updated()
 
@@ -1407,10 +1412,11 @@ class PromptQueue:
         with self.mutex:
             for x in range(len(self.queue)):
                 if function(self.queue[x]):
-                    if len(self.queue) == 1:
+                    item = self.queue.pop(x)
+                    comfy.model_management.cancellation_manager.unregister_prompt(item[1])
+                    if len(self.queue) == 0:
                         self.wipe_queue()
                     else:
-                        self.queue.pop(x)
                         heapq.heapify(self.queue)
                     self.server.queue_updated()
                     return True
