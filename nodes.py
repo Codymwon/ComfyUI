@@ -38,6 +38,60 @@ import comfy.model_management
 from comfy.cli_args import args
 
 import importlib
+import importlib.util
+
+class ComfyLegacyImportFinder:
+    SHIM_MODULES = {
+        "utils": "comfy.utils",
+        "model_management": "comfy.model_management",
+        "samplers": "comfy.samplers",
+        "sd": "comfy.sd",
+        "diffusers_load": "comfy.diffusers_load",
+    }
+
+    def find_spec(self, fullname, path, target=None):
+        parts = fullname.split(".")
+        root_name = parts[0]
+        if root_name in self.SHIM_MODULES:
+            target_root = self.SHIM_MODULES[root_name]
+            target_name = ".".join([target_root] + parts[1:])
+            logging.debug(f"[DEPRECATION] Custom node imported legacy '{fullname}', redirecting to '{target_name}'")
+            try:
+                mod = importlib.import_module(target_name)
+            except Exception:
+                return None
+            if root_name == "utils":
+                utils_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "utils")
+                if os.path.isdir(utils_dir):
+                    if not hasattr(mod, "__path__") or not mod.__path__:
+                        mod.__path__ = [utils_dir]
+                    elif utils_dir not in mod.__path__:
+                        mod.__path__.append(utils_dir)
+            if target_name in sys.modules:
+                sys.modules[fullname] = sys.modules[target_name]
+            return importlib.util.find_spec(target_name)
+        return None
+
+def install_legacy_import_shims():
+    if not any(isinstance(f, ComfyLegacyImportFinder) for f in sys.meta_path):
+        sys.meta_path.insert(0, ComfyLegacyImportFinder())
+
+    import comfy.utils
+    utils_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "utils")
+    if os.path.isdir(utils_dir):
+        if not hasattr(comfy.utils, "__path__") or not comfy.utils.__path__:
+            comfy.utils.__path__ = [utils_dir]
+        elif utils_dir not in comfy.utils.__path__:
+            comfy.utils.__path__.append(utils_dir)
+
+    old_utils = sys.modules.get("utils")
+    if old_utils is not None and old_utils is not comfy.utils:
+        for k, v in list(old_utils.__dict__.items()):
+            if not k.startswith("__") and k != "comfy" and not hasattr(comfy.utils, k):
+                setattr(comfy.utils, k, v)
+    sys.modules["utils"] = comfy.utils
+
+install_legacy_import_shims()
 
 from app import governance
 import folder_paths
@@ -2361,8 +2415,7 @@ async def init_external_custom_nodes():
     Returns:
         None
     """
-    # TODO: remove at some point when custom nodes don't break.
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "comfy"))
+    install_legacy_import_shims()
 
     base_node_names = set(NODE_CLASS_MAPPINGS.keys())
     node_paths = folder_paths.get_folder_paths("custom_nodes")

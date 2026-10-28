@@ -275,6 +275,7 @@ class PromptServer():
         self.messages = asyncio.Queue()
         self.client_session:Optional[aiohttp.ClientSession] = None
         self.number = 0
+        self.gpu_mutex = asyncio.Lock()
 
         middlewares = [cache_control, deprecation_warning]
         if args.enable_compress_response_body:
