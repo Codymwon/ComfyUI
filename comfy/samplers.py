@@ -25,6 +25,17 @@ import scipy.stats
 import numpy
 
 
+from comfy.model_patcher import TeaCacheState
+
+def is_unit_multiplier(m):
+    if isinstance(m, (int, float)):
+        return m == 1.0
+    if isinstance(m, torch.Tensor):
+        if m.numel() == 1:
+            return bool((m == 1.0).item())
+        return False
+    return False
+
 def add_area_dims(area, num_dims):
     while (len(area) // 2) < num_dims:
         area = [2147483648] + area[:len(area) // 2] + [0] + area[len(area) // 2:]
@@ -75,8 +86,13 @@ def get_area_and_mult(conds, x_in, timestep_in):
         mask = mask * mask_strength
         mask = mask.unsqueeze(1).repeat((input_x.shape[0] // mask.shape[0], input_x.shape[1]) + (1, ) * (mask.ndim - 1))
     else:
-        mask = torch.ones_like(input_x)
-    mult = mask * strength
+        if area is not None:
+            mask = torch.ones_like(input_x)
+            mult = mask * strength
+        elif strength != 1.0:
+            mult = float(strength)
+        else:
+            mult = 1.0
 
     if 'mask' not in conds and area is not None:
         fuzz = 8
@@ -233,7 +249,7 @@ def _calc_cond_batch(model: BaseModel, conds: list[list[dict]], x_in: torch.Tens
 
     for i in range(len(conds)):
         out_conds.append(torch.zeros_like(x_in))
-        out_counts.append(torch.ones_like(x_in) * 1e-37)
+        out_counts.append(None)
 
         cond = conds[i]
         default_c = []
@@ -257,6 +273,24 @@ def _calc_cond_batch(model: BaseModel, conds: list[list[dict]], x_in: torch.Tens
 
     model.current_patcher.prepare_state(timestep, model_options)
 
+    # Check if area weights or multiple conds require out_counts tracking
+    cond_counts = collections.Counter()
+    cond_needs_counts = [False] * len(conds)
+    if has_default_conds:
+        for i, dc in enumerate(default_conds):
+            if len(dc) > 0:
+                cond_needs_counts[i] = True
+
+    for hooks, to_run in hooked_to_run.items():
+        for p, cond_index in to_run:
+            cond_counts[cond_index] += 1
+            if p.area is not None or not is_unit_multiplier(p.mult) or cond_counts[cond_index] > 1:
+                cond_needs_counts[cond_index] = True
+
+    for i in range(len(conds)):
+        if cond_needs_counts[i]:
+            out_counts[i] = torch.ones_like(x_in) * 1e-37
+
     # run every hooked_to_run separately
     for hooks, to_run in hooked_to_run.items():
         while len(to_run) > 0:
@@ -270,18 +304,35 @@ def _calc_cond_batch(model: BaseModel, conds: list[list[dict]], x_in: torch.Tens
             to_batch_temp.reverse()
             to_batch = to_batch_temp[:1]
 
-            free_memory = model.current_patcher.get_free_memory(x_in.device)
-            for i in range(1, len(to_batch_temp) + 1):
-                batch_amount = to_batch_temp[:len(to_batch_temp)//i]
-                input_shape = [len(batch_amount) * first_shape[0]] + list(first_shape)[1:]
-                cond_shapes = collections.defaultdict(list)
-                for tt in batch_amount:
-                    for k, v in to_run[tt][0].conditioning.items():
-                        cond_shapes[k].append(v.size())
+            # Step-invariant dynamic batch schedule caching
+            step = model_options.get("transformer_options", {}).get("current_step", None)
+            cache_key = (first_shape, len(to_batch_temp), str(x_in.device))
+            batch_cache = getattr(model, "_batch_schedule_cache", None)
+            if batch_cache is None or not isinstance(batch_cache, dict):
+                batch_cache = {}
+                model._batch_schedule_cache = batch_cache
 
-                if model.memory_required(input_shape, cond_shapes=cond_shapes) * 1.5 < free_memory:
-                    to_batch = batch_amount
-                    break
+            last_step = getattr(model, "_batch_schedule_cache_step", None)
+            if step == 0 and last_step is not None and last_step != 0:
+                batch_cache.clear()
+            model._batch_schedule_cache_step = step
+
+            if (step is None or step > 0) and cache_key in batch_cache:
+                to_batch = batch_cache[cache_key]
+            else:
+                free_memory = model.current_patcher.get_free_memory(x_in.device)
+                for i in range(1, len(to_batch_temp) + 1):
+                    batch_amount = to_batch_temp[:len(to_batch_temp)//i]
+                    input_shape = [len(batch_amount) * first_shape[0]] + list(first_shape)[1:]
+                    cond_shapes = collections.defaultdict(list)
+                    for tt in batch_amount:
+                        for k, v in to_run[tt][0].conditioning.items():
+                            cond_shapes[k].append(v.size())
+
+                    if model.memory_required(input_shape, cond_shapes=cond_shapes) * 1.5 < free_memory:
+                        to_batch = batch_amount
+                        break
+                batch_cache[cache_key] = to_batch
 
             input_x = []
             mult = []
@@ -337,7 +388,9 @@ def _calc_cond_batch(model: BaseModel, conds: list[list[dict]], x_in: torch.Tens
             for o in range(batch_chunks):
                 cond_index = cond_or_uncond[o]
                 a = area[o]
-                if a is None:
+                if out_counts[cond_index] is None:
+                    out_conds[cond_index] += output[o]
+                elif a is None:
                     out_conds[cond_index] += output[o] * mult[o]
                     out_counts[cond_index] += mult[o]
                 else:
@@ -351,7 +404,8 @@ def _calc_cond_batch(model: BaseModel, conds: list[list[dict]], x_in: torch.Tens
                     out_cts += mult[o]
 
     for i in range(len(out_conds)):
-        out_conds[i] /= out_counts[i]
+        if out_counts[i] is not None:
+            out_conds[i] /= out_counts[i]
 
     return out_conds
 
@@ -371,7 +425,7 @@ def _calc_cond_batch_multigpu(model: BaseModel, conds: list[list[dict]], x_in: t
 
     for i in range(len(conds)):
         out_conds.append(torch.zeros_like(x_in))
-        out_counts.append(torch.ones_like(x_in) * 1e-37)
+        out_counts.append(None)
 
         cond = conds[i]
         default_c = []
@@ -394,6 +448,24 @@ def _calc_cond_batch_multigpu(model: BaseModel, conds: list[list[dict]], x_in: t
         finalize_default_conds(model, hooked_to_run, default_conds, x_in, timestep, model_options)
 
     model.current_patcher.prepare_state(timestep, model_options)
+
+    # Check if area weights or multiple conds require out_counts tracking
+    cond_counts = collections.Counter()
+    cond_needs_counts = [False] * len(conds)
+    if has_default_conds:
+        for i, dc in enumerate(default_conds):
+            if len(dc) > 0:
+                cond_needs_counts[i] = True
+
+    for hooks, to_run in hooked_to_run.items():
+        for p, cond_index in to_run:
+            cond_counts[cond_index] += 1
+            if p.area is not None or not is_unit_multiplier(p.mult) or cond_counts[cond_index] > 1:
+                cond_needs_counts[cond_index] = True
+
+    for i in range(len(conds)):
+        if cond_needs_counts[i]:
+            out_counts[i] = torch.ones_like(x_in) * 1e-37
 
     devices = list(model_options['multigpu_clones'].keys())
     device_batched_hooked_to_run: dict[torch.device, list[tuple[comfy.hooks.HookGroup, tuple]]] = {}
@@ -436,17 +508,34 @@ def _calc_cond_batch_multigpu(model: BaseModel, conds: list[list[dict]], x_in: t
             to_batch_temp.reverse()
             to_batch = to_batch_temp[:1]
 
-            free_memory = comfy.model_management.get_free_memory(current_device)
-            for i in range(1, len(to_batch_temp) + 1):
-                batch_amount = to_batch_temp[:len(to_batch_temp)//i]
-                input_shape = [len(batch_amount) * first_shape[0]] + list(first_shape)[1:]
-                cond_shapes = collections.defaultdict(list)
-                for tt in batch_amount:
-                    for k, v in to_run[tt][0].conditioning.items():
-                        cond_shapes[k].append(v.size())
-                if model.memory_required(input_shape, cond_shapes=cond_shapes) * 1.5 < free_memory:
-                    to_batch = batch_amount
-                    break
+            # Step-invariant dynamic batch schedule caching
+            step = model_options.get("transformer_options", {}).get("current_step", None)
+            cache_key = (first_shape, len(to_batch_temp), str(current_device))
+            multigpu_cache = getattr(model, "_batch_schedule_cache_multigpu", None)
+            if multigpu_cache is None or not isinstance(multigpu_cache, dict):
+                multigpu_cache = {}
+                model._batch_schedule_cache_multigpu = multigpu_cache
+
+            last_step = getattr(model, "_batch_schedule_cache_multigpu_step", None)
+            if step == 0 and last_step is not None and last_step != 0:
+                multigpu_cache.clear()
+            model._batch_schedule_cache_multigpu_step = step
+
+            if (step is None or step > 0) and cache_key in multigpu_cache:
+                to_batch = multigpu_cache[cache_key]
+            else:
+                free_memory = comfy.model_management.get_free_memory(current_device)
+                for i in range(1, len(to_batch_temp) + 1):
+                    batch_amount = to_batch_temp[:len(to_batch_temp)//i]
+                    input_shape = [len(batch_amount) * first_shape[0]] + list(first_shape)[1:]
+                    cond_shapes = collections.defaultdict(list)
+                    for tt in batch_amount:
+                        for k, v in to_run[tt][0].conditioning.items():
+                            cond_shapes[k].append(v.size())
+                    if model.memory_required(input_shape, cond_shapes=cond_shapes) * 1.5 < free_memory:
+                        to_batch = batch_amount
+                        break
+                multigpu_cache[cache_key] = to_batch
 
             conds_to_batch = [to_run.pop(x) for x in to_batch]
             device_load[current_device] += len(conds_to_batch)
@@ -567,7 +656,9 @@ def _calc_cond_batch_multigpu(model: BaseModel, conds: list[list[dict]], x_in: t
         for o in range(batch_chunks):
             cond_index = cond_or_uncond[o]
             a = area[o]
-            if a is None:
+            if out_counts[cond_index] is None:
+                out_conds[cond_index] += output[o]
+            elif a is None:
                 out_conds[cond_index] += output[o] * mult[o]
                 out_counts[cond_index] += mult[o]
             else:
@@ -581,7 +672,8 @@ def _calc_cond_batch_multigpu(model: BaseModel, conds: list[list[dict]], x_in: t
                 out_cts += mult[o]
 
     for i in range(len(out_conds)):
-        out_conds[i] /= out_counts[i]
+        if out_counts[i] is not None:
+            out_conds[i] /= out_counts[i]
 
     return out_conds
 
@@ -996,6 +1088,8 @@ class KSAMPLER(Sampler):
         first_step = True
         def k_callback(x):
             nonlocal first_step
+            if "model_options" in extra_args and "transformer_options" in extra_args["model_options"]:
+                extra_args["model_options"]["transformer_options"]["current_step"] = x["i"] + 1
             if first_step:
                 detail("First sampler step: model=%s sampler=%s step=%s total_steps=%s cfg=%s seed=%s sigma=%s sigma_hat=%s latent_shape=%s denoised_shape=%s", model_wrap.model_patcher.model.__class__.__name__, getattr(self.sampler_function, "__name__", "unknown"), x["i"], total_steps, model_wrap.cfg, extra_args.get("seed"), x.get("sigma"), x.get("sigma_hat"), tuple(x["x"].shape), tuple(x["denoised"].shape))
                 first_step = False
@@ -1227,6 +1321,7 @@ class CFGGuider:
 
         extra_model_options = comfy.model_patcher.create_model_options_clone(self.model_options)
         extra_model_options.setdefault("transformer_options", {})["sample_sigmas"] = sigmas
+        extra_model_options["transformer_options"]["current_step"] = 0
         extra_args = {"model_options": extra_model_options, "seed": seed}
 
         executor = comfy.patcher_extension.WrapperExecutor.new_class_executor(
@@ -1265,6 +1360,14 @@ class CFGGuider:
                 thread_pool = self.model_options.pop("multigpu_thread_pool", None)
                 if thread_pool is not None:
                     thread_pool.shutdown()
+                if hasattr(self.inner_model, "_batch_schedule_cache"):
+                    self.inner_model._batch_schedule_cache = None
+                if hasattr(self.inner_model, "_batch_schedule_cache_step"):
+                    self.inner_model._batch_schedule_cache_step = None
+                if hasattr(self.inner_model, "_batch_schedule_cache_multigpu"):
+                    self.inner_model._batch_schedule_cache_multigpu = None
+                if hasattr(self.inner_model, "_batch_schedule_cache_multigpu_step"):
+                    self.inner_model._batch_schedule_cache_multigpu_step = None
                 self.model_patcher.cleanup()
                 for multigpu_patcher in multigpu_patchers:
                     multigpu_patcher.cleanup()
