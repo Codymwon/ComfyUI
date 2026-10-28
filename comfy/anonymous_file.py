@@ -17,6 +17,46 @@ if os.name == "nt":
     _kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
 
 
+elif sys.platform == "linux":
+    if hasattr(os, "memfd_create"):
+        _linux_memfd_create = os.memfd_create
+        _MFD_CLOEXEC = getattr(os, "MFD_CLOEXEC", 1)
+    else:
+        import ctypes
+        _libc = ctypes.CDLL(None, use_errno=True)
+        if hasattr(_libc, "memfd_create"):
+            _libc.memfd_create.argtypes = [ctypes.c_char_p, ctypes.c_uint]
+            _libc.memfd_create.restype = ctypes.c_int
+
+            def _linux_memfd_create(name, flags):
+                name_bytes = name.encode("utf-8") if isinstance(name, str) else name
+                fd = _libc.memfd_create(name_bytes, flags)
+                if fd < 0:
+                    err = ctypes.get_errno()
+                    raise OSError(err, os.strerror(err))
+                return fd
+
+            _MFD_CLOEXEC = 1
+        else:
+            import platform
+            machine = platform.machine().lower()
+            _syscall_map = {"x86_64": 319, "amd64": 319, "aarch64": 279, "arm64": 279, "i386": 356, "i686": 356, "armv7l": 385}
+            _sys_memfd_create = _syscall_map.get(machine, None)
+            if _sys_memfd_create is not None:
+                def _linux_memfd_create(name, flags):
+                    name_bytes = name.encode("utf-8") if isinstance(name, str) else name
+                    fd = _libc.syscall(_sys_memfd_create, name_bytes, flags)
+                    if fd < 0:
+                        err = ctypes.get_errno()
+                        raise OSError(err, os.strerror(err))
+                    return fd
+
+                _MFD_CLOEXEC = 1
+            else:
+                _linux_memfd_create = None
+                _MFD_CLOEXEC = 1
+
+
 def create_anonymous_file(size=0):
     """Return an unbuffered binary file owned by the caller, initially sized in bytes.
 
@@ -36,8 +76,21 @@ def create_anonymous_file(size=0):
         file = open(path, "x+b", buffering=0,
                     opener=lambda path, mode: os.open(path, mode | flags, 0o600))
     elif sys.platform == "linux":
-        file = open("aimdo", "w+b", buffering=0,
-                    opener=lambda name, mode: os.memfd_create(name, os.MFD_CLOEXEC))
+        file = None
+        if _linux_memfd_create is not None:
+            try:
+                file = open("aimdo", "w+b", buffering=0,
+                            opener=lambda name, mode: _linux_memfd_create(name, _MFD_CLOEXEC))
+            except OSError as err:
+                if err.errno != 38:  # ENOSYS
+                    raise
+        if file is None:
+            path = os.path.join(tempfile.gettempdir(), f"aimdo-{uuid.uuid4().hex}")
+            file = open(path, "x+b", buffering=0)
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
     else:
         raise NotImplementedError("anonymous files require Linux or Windows")
 
