@@ -1302,12 +1302,15 @@ class VAE:
                     if preallocated:
                         self.first_stage_model.decode(samples, output_buffer=pixel_samples[x:x+batch_number], **vae_options)
                     else:
-                        out = self.first_stage_model.decode(samples, **vae_options).to(device=self.output_device, dtype=self.vae_output_dtype(), copy=True)
-                        if pixel_samples is None:
-                            with comfy.model_prefetch.pause_malloc_graph():
-                                pixel_samples = torch.empty((samples_in.shape[0],) + tuple(out.shape[1:]), device=self.output_device, dtype=self.vae_output_dtype())
-                        pixel_samples[x:x+batch_number].copy_(out)
-                        del out
+                        out = self.first_stage_model.decode(samples, **vae_options).to(device=self.output_device, dtype=self.vae_output_dtype())
+                        if pixel_samples is None and samples_in.shape[0] <= batch_number:
+                            pixel_samples = out
+                        else:
+                            if pixel_samples is None:
+                                with comfy.model_prefetch.pause_malloc_graph():
+                                    pixel_samples = torch.empty((samples_in.shape[0],) + tuple(out.shape[1:]), device=self.output_device, dtype=self.vae_output_dtype())
+                            pixel_samples[x:x+batch_number].copy_(out)
+                            del out
                     self.process_output(pixel_samples[x:x+batch_number])
             except Exception as e:
                 model_management.raise_non_oom(e)

@@ -120,7 +120,7 @@ class ConditioningAverage :
             pooled_output_to = conditioning_to[i][1].get("pooled_output", pooled_output_from)
             t0 = cond_from[:,:t1.shape[1]]
             if t0.shape[1] < t1.shape[1]:
-                t0 = torch.cat([t0] + [torch.zeros((1, (t1.shape[1] - t0.shape[1]), t1.shape[2]))], dim=1)
+                t0 = torch.cat([t0, torch.zeros((t0.shape[0], (t1.shape[1] - t0.shape[1]), t1.shape[2]), device=t0.device, dtype=t0.dtype)], dim=1)
 
             tw = torch.mul(t1, conditioning_to_strength) + torch.mul(t0, (1.0 - conditioning_to_strength))
             t_to = conditioning_to[i][1].copy()
@@ -445,11 +445,8 @@ class VAEEncodeForInpaint:
 
             mask_erosion = torch.clamp(torch.nn.functional.conv2d(mask.round(), kernel_tensor, padding=padding), 0, 1)
 
-        m = (1.0 - mask.round()).squeeze(1)
-        for i in range(3):
-            pixels[:,:,:,i] -= 0.5
-            pixels[:,:,:,i] *= m
-            pixels[:,:,:,i] += 0.5
+        m = (1.0 - mask.round()).squeeze(1).unsqueeze(-1)
+        pixels = (pixels - 0.5) * m + 0.5
         t = vae.encode(pixels)
 
         return ({"samples":t, "noise_mask": (mask_erosion[:,:,:x,:y].round())}, )
@@ -485,11 +482,8 @@ class InpaintModelConditioning:
             pixels = pixels[:,x_offset:x + x_offset, y_offset:y + y_offset,:]
             mask = mask[:,:,x_offset:x + x_offset, y_offset:y + y_offset]
 
-        m = (1.0 - mask.round()).squeeze(1)
-        for i in range(3):
-            pixels[:,:,:,i] -= 0.5
-            pixels[:,:,:,i] *= m
-            pixels[:,:,:,i] += 0.5
+        m = (1.0 - mask.round()).squeeze(1).unsqueeze(-1)
+        pixels = (pixels - 0.5) * m + 0.5
         concat_latent = vae.encode(pixels)
         orig_latent = vae.encode(orig_pixels)
 
@@ -1471,16 +1465,22 @@ class LatentComposite:
         else:
             samples_from = samples_from[:,:,:samples_to.shape[2] - y, :samples_to.shape[3] - x]
             mask = torch.ones_like(samples_from)
-            for t in range(feather):
-                if y != 0:
-                    mask[:,:,t:1+t,:] *= ((1.0/feather) * (t + 1))
-
-                if y + samples_from.shape[2] < samples_to.shape[2]:
-                    mask[:,:,mask.shape[2] -1 -t: mask.shape[2]-t,:] *= ((1.0/feather) * (t + 1))
-                if x != 0:
-                    mask[:,:,:,t:1+t] *= ((1.0/feather) * (t + 1))
-                if x + samples_from.shape[3] < samples_to.shape[3]:
-                    mask[:,:,:,mask.shape[3]- 1 - t: mask.shape[3]- t] *= ((1.0/feather) * (t + 1))
+            if feather > 0:
+                ramp = torch.linspace(1.0 / feather, 1.0, feather, device=mask.device, dtype=mask.dtype)
+                fy = min(feather, mask.shape[2])
+                fx = min(feather, mask.shape[3])
+                if fy > 0:
+                    ramp_y = ramp[:fy].view(1, 1, fy, 1)
+                    if y != 0:
+                        mask[:, :, :fy, :] *= ramp_y
+                    if y + samples_from.shape[2] < samples_to.shape[2]:
+                        mask[:, :, -fy:, :] *= ramp_y.flip(2)
+                if fx > 0:
+                    ramp_x = ramp[:fx].view(1, 1, 1, fx)
+                    if x != 0:
+                        mask[:, :, :, :fx] *= ramp_x
+                    if x + samples_from.shape[3] < samples_to.shape[3]:
+                        mask[:, :, :, -fx:] *= ramp_x.flip(3)
             rev_mask = torch.ones_like(mask) - mask
             s[:,:,y:y+samples_from.shape[2],x:x+samples_from.shape[3]] = samples_from[:,:,:samples_to.shape[2] - y, :samples_to.shape[3] - x] * mask + s[:,:,y:y+samples_from.shape[2],x:x+samples_from.shape[3]] * rev_mask
         samples_out["samples"] = s
@@ -1514,9 +1514,7 @@ class LatentBlend:
         samples2 = samples2["samples"]
 
         if samples1.shape != samples2.shape:
-            samples2.permute(0, 3, 1, 2)
             samples2 = comfy.utils.common_upscale(samples2, samples1.shape[3], samples1.shape[2], 'bicubic', crop='center')
-            samples2.permute(0, 2, 3, 1)
 
         samples_blended = self.blend_mode(samples1, samples2, blend_mode)
         samples_blended = samples1 * blend_factor + samples_blended * (1 - blend_factor)
