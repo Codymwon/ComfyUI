@@ -14,6 +14,7 @@ import time
 import random
 import logging
 
+from io import BytesIO
 from PIL import Image, ImageOps, ImageSequence
 from PIL.PngImagePlugin import PngInfo
 
@@ -50,8 +51,8 @@ if args.enable_manager:
 def before_node_execution():
     comfy.model_management.throw_exception_if_processing_interrupted()
 
-def interrupt_processing(value=True):
-    comfy.model_management.interrupt_current_processing(value)
+def interrupt_processing(value=True, prompt_id=None):
+    comfy.model_management.interrupt_current_processing(value, prompt_id=prompt_id)
 
 MAX_RESOLUTION=16384
 
@@ -1715,7 +1716,22 @@ class SaveImage:
 
             filename_with_batch_num = filename.replace("%batch_num%", str(batch_number))
             file = f"{filename_with_batch_num}_{counter:05}_.png"
-            img.save(os.path.join(full_output_folder, file), pnginfo=metadata, compress_level=self.compress_level)
+            full_path = os.path.join(full_output_folder, file)
+            buf = BytesIO()
+            img.save(buf, format="PNG", pnginfo=metadata, compress_level=self.compress_level)
+            image_bytes = buf.getvalue()
+
+            server_module = sys.modules.get("server")
+            if server_module and hasattr(server_module, "PromptServer"):
+                srv = getattr(server_module.PromptServer, "instance", None)
+                if srv is not None and hasattr(srv, "store_transient_image"):
+                    srv.store_transient_image(os.path.normpath(full_path), image_bytes, "image/png")
+                    srv.store_transient_image(os.path.abspath(full_path), image_bytes, "image/png")
+                    srv.store_transient_image((file, subfolder, self.type), image_bytes, "image/png")
+
+            with open(full_path, "wb") as f:
+                f.write(image_bytes)
+
             results.append({
                 "filename": file,
                 "subfolder": subfolder,
@@ -2309,6 +2325,11 @@ async def load_custom_node(module_path: str, ignore=set(), module_parent="custom
                 for name, display_name in module.NODE_DISPLAY_NAME_MAPPINGS.items():
                     if name not in ignore:
                         NODE_DISPLAY_NAME_MAPPINGS[name] = display_name
+            server_module = sys.modules.get("server")
+            if server_module and hasattr(server_module, "PromptServer"):
+                srv = getattr(server_module.PromptServer, "instance", None)
+                if srv is not None and hasattr(srv, "invalidate_object_info_cache"):
+                    srv.invalidate_object_info_cache()
             return True
         # V3 Extension Definition
         elif hasattr(module, "comfy_entrypoint"):
@@ -2337,6 +2358,11 @@ async def load_custom_node(module_path: str, ignore=set(), module_parent="custom
                         node_cls.RELATIVE_PYTHON_MODULE = "{}.{}".format(module_parent, get_module_name(module_path))
                         if schema.display_name is not None:
                             NODE_DISPLAY_NAME_MAPPINGS[schema.node_id] = schema.display_name
+                server_module = sys.modules.get("server")
+                if server_module and hasattr(server_module, "PromptServer"):
+                    srv = getattr(server_module.PromptServer, "instance", None)
+                    if srv is not None and hasattr(srv, "invalidate_object_info_cache"):
+                        srv.invalidate_object_info_cache()
                 return True
             except Exception as e:
                 logging.warning(f"Error while calling comfy_entrypoint in {module_path}: {e}")

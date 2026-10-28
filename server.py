@@ -18,6 +18,9 @@ from comfy_execution.jobs import (
     CANCEL_PENDING,
     CANCEL_RUNNING,
 )
+import collections
+import threading
+import hashlib
 import uuid
 import urllib
 import json
@@ -330,6 +333,12 @@ class PromptServer():
         self.last_node_id = None
         self.client_id = None
         self.workflow_metadata = {}
+        self._object_info_etag = None
+        self._object_info_json = None
+        self._cached_object_info = None
+        self.transient_image_cache = collections.OrderedDict()
+        self.transient_image_cache_max = 256
+        self.transient_image_cache_lock = threading.Lock()
 
         self.on_prompt_handlers = []
 
@@ -643,6 +652,25 @@ class PromptServer():
                     filename = os.path.basename(filename)
                     file = os.path.join(output_dir, filename)
 
+                subfolder_param = request.rel_url.query.get("subfolder", "")
+                type_param = request.rel_url.query.get("type", "output")
+                cached = self.get_transient_image(os.path.normpath(file))
+                if cached is None:
+                    cached = self.get_transient_image(os.path.abspath(file))
+                if cached is None:
+                    cached = self.get_transient_image((filename, subfolder_param, type_param))
+
+                channel_param = request.rel_url.query.get("channel", "rgba")
+                if cached is not None and 'preview' not in request.rel_url.query and channel_param in ('rgba', ''):
+                    image_bytes, content_type = cached
+                    safe_filename = filename.replace("\\", "\\\\").replace('"', '\\"')
+                    headers = {
+                        "Content-Type": content_type,
+                        "Content-Disposition": f'filename="{safe_filename}"',
+                        "X-Content-Type-Options": "nosniff"
+                    }
+                    return web.Response(body=image_bytes, headers=headers)
+
                 if os.path.isfile(file):
                     if 'preview' in request.rel_url.query:
                         with Image.open(file) as img:
@@ -892,6 +920,31 @@ class PromptServer():
         @routes.get("/object_info")
         async def get_object_info(request):
             self.asset_manager.ensure_scan_started()
+
+            def _etag_matches(client_etag, current_etag):
+                if not client_etag or not current_etag:
+                    return False
+                tokens = [t.strip() for t in client_etag.split(",")]
+                clean_etag = current_etag.strip().strip('"')
+                for token in tokens:
+                    token = token.strip()
+                    if token == "*":
+                        return True
+                    if token.startswith("W/") or token.startswith("w/"):
+                        token = token[2:].strip()
+                    if token.strip('"') == clean_etag:
+                        return True
+                return False
+
+            if_none_match = request.headers.get("If-None-Match")
+            cached_etag = getattr(self, "_object_info_etag", None)
+            cached_json = getattr(self, "_object_info_json", None)
+
+            if cached_etag and cached_json is not None:
+                if _etag_matches(if_none_match, cached_etag):
+                    return web.Response(status=304, headers={"ETag": cached_etag, "Cache-Control": "public, must-revalidate"})
+                return web.Response(text=cached_json, content_type="application/json", headers={"ETag": cached_etag, "Cache-Control": "public, must-revalidate"})
+
             with folder_paths.cache_helper:
                 out = {}
                 for x in nodes.NODE_CLASS_MAPPINGS:
@@ -900,7 +953,16 @@ class PromptServer():
                     except Exception:
                         logging.error(f"[ERROR] An error occurred while retrieving information for the '{x}' node.")
                         logging.error(traceback.format_exc())
-                return web.json_response(out)
+
+                json_str = json.dumps(out)
+                new_etag = f'"{hashlib.sha256(json_str.encode()).hexdigest()[:16]}"'
+                self._object_info_etag = new_etag
+                self._object_info_json = json_str
+                self._cached_object_info = json_str
+
+                if _etag_matches(if_none_match, new_etag):
+                    return web.Response(status=304, headers={"ETag": new_etag, "Cache-Control": "public, must-revalidate"})
+                return web.Response(text=json_str, content_type="application/json", headers={"ETag": new_etag, "Cache-Control": "public, must-revalidate"})
 
         @routes.get("/object_info/{node_class}")
         async def get_object_info_node(request):
@@ -1043,7 +1105,7 @@ class PromptServer():
             Returns True when a cancel was actually dispatched (running or
             pending job), False when the call was a no-op (terminal/unknown id).
             """
-            running, queued = self.prompt_queue.get_current_queue()
+            running, queued = self.prompt_queue.get_current_queue_volatile()
             history = self.prompt_queue.get_history()
 
             def interrupt(prompt_id):
@@ -1269,19 +1331,8 @@ class PromptServer():
             # Check if a specific prompt_id was provided for targeted interruption
             prompt_id = json_data.get('prompt_id')
             if prompt_id:
-                currently_running, _ = self.prompt_queue.get_current_queue()
-
-                # Check if the prompt_id matches any currently running prompt
-                should_interrupt = False
-                for item in currently_running:
-                    # item structure: (number, prompt_id, prompt, extra_data, outputs_to_execute)
-                    if item[1] == prompt_id:
-                        logging.info(f"Interrupting prompt {prompt_id}")
-                        should_interrupt = True
-                        break
-
-                if should_interrupt:
-                    nodes.interrupt_processing()
+                if self.prompt_queue.interrupt_if_running(prompt_id):
+                    logging.info(f"Interrupting prompt {prompt_id}")
                 else:
                     logging.info(f"Prompt {prompt_id} is not currently running, skipping interrupt")
             else:
@@ -1435,11 +1486,14 @@ class PromptServer():
         elif image_type == "PNG":
             type_num = 2
 
-        bytesIO = BytesIO()
-        header = struct.pack(">I", type_num)
-        bytesIO.write(header)
-        image.save(bytesIO, format=image_type, quality=95, compress_level=1)
-        preview_bytes = bytesIO.getvalue()
+        def _encode_preview(t_num, img, fmt, quality):
+            buf = BytesIO()
+            header = struct.pack(">I", t_num)
+            buf.write(header)
+            img.save(buf, format=fmt, quality=quality, compress_level=1)
+            return buf.getvalue()
+
+        preview_bytes = await asyncio.to_thread(_encode_preview, type_num, image, image_type, 95)
         await self.send_bytes(BinaryEventTypes.PREVIEW_IMAGE, preview_bytes, sid=sid)
 
     async def send_image_with_metadata(self, image_data, metadata=None, sid=None):
@@ -1467,9 +1521,12 @@ class PromptServer():
         metadata_length = len(metadata_json)
 
         # Prepare image data
-        bytesIO = BytesIO()
-        image.save(bytesIO, format=image_type, quality=95, compress_level=1)
-        image_bytes = bytesIO.getvalue()
+        def _encode_image(img, fmt, quality):
+            buf = BytesIO()
+            img.save(buf, format=fmt, quality=quality, compress_level=1)
+            return buf.getvalue()
+
+        image_bytes = await asyncio.to_thread(_encode_image, image, image_type, 95)
 
         # Combine metadata and image
         combined_data = bytearray()
@@ -1521,6 +1578,26 @@ class PromptServer():
 
     def queue_updated(self):
         self.send_sync("status", { "status": self.get_queue_info() })
+
+    def invalidate_object_info_cache(self):
+        self._object_info_etag = None
+        self._object_info_json = None
+        self._cached_object_info = None
+
+    def store_transient_image(self, file_key, image_bytes, content_type="image/png"):
+        with self.transient_image_cache_lock:
+            self.transient_image_cache.pop(file_key, None)
+            while len(self.transient_image_cache) >= self.transient_image_cache_max:
+                self.transient_image_cache.popitem(last=False)
+            self.transient_image_cache[file_key] = (image_bytes, content_type)
+
+    def get_transient_image(self, file_key):
+        with self.transient_image_cache_lock:
+            item = self.transient_image_cache.get(file_key)
+            if item is not None:
+                self.transient_image_cache.move_to_end(file_key)
+                return item
+            return None
 
     async def publish_loop(self):
         while True:
