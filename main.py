@@ -423,6 +423,7 @@ def prompt_worker(q, server_instance, asset_manager):
 
             if free_memory:
                 e.reset()
+                comfy.model_management.soft_empty_cache(True)
                 need_gc = True
                 last_gc_collect = 0
 
@@ -430,7 +431,8 @@ def prompt_worker(q, server_instance, asset_manager):
                 current_time = time.perf_counter()
                 if (current_time - last_gc_collect) > gc_collect_interval:
                     gc.collect()
-                    comfy.model_management.soft_empty_cache()
+                    # Expandable segments manages cached blocks without driver thrashing.
+                    # Only call soft_empty_cache if explicit model unloading occurred.
                     last_gc_collect = current_time
                     need_gc = False
                     hook_breaker_ac10a0.restore_functions()

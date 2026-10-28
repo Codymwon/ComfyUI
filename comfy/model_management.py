@@ -2157,20 +2157,25 @@ def soft_empty_cache(force=False):
     if cpu_state == CPUState.MPS:
         torch.mps.empty_cache()
     elif is_intel_xpu():
-        torch.xpu.synchronize()
-        torch.xpu.empty_cache()
+        if force:
+            torch.xpu.synchronize()
+            torch.xpu.empty_cache()
     elif is_ascend_npu():
-        torch.npu.empty_cache()
+        if force:
+            torch.npu.empty_cache()
     elif is_mlu():
-        torch.mlu.empty_cache()
+        if force:
+            torch.mlu.empty_cache()
     elif torch.cuda.is_available():
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
+        # Only flush the PyTorch caching allocator if explicitly forced (OOM or unload)
+        if force:
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
 
 def unload_all_models():
     for device in get_all_torch_devices():
         free_memory(1e30, device)
+    soft_empty_cache(True)
 
 def unload_model_and_clones(model: ModelPatcher, unload_additional_models=True, all_devices=False):
     'Unload only model and its clones - primarily for multigpu cloning purposes.'
