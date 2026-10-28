@@ -20,6 +20,18 @@ class NodeInputError(Exception):
 class NodeNotFoundError(Exception):
     pass
 
+class ResourceClass:
+    CPU_IO_CONCURRENT = "cpu_io"    # Image loaders, tokenizers, metadata, masks
+    GPU_EXCLUSIVE = "gpu_exclusive" # Samplers, DiT / UNet forwards, VAE decodes
+
+def classify_node_resource(class_type: str) -> str:
+    if not class_type:
+        return ResourceClass.CPU_IO_CONCURRENT
+    gpu_types = {"KSampler", "KSamplerAdvanced", "VAEDecode", "VAEEncode"}
+    if class_type in gpu_types or "Sampler" in class_type:
+        return ResourceClass.GPU_EXCLUSIVE
+    return ResourceClass.CPU_IO_CONCURRENT
+
 class DynamicPrompt:
     def __init__(self, original_prompt):
         # The original prompt provided by the user
@@ -68,6 +80,10 @@ class DynamicPrompt:
 
     def all_node_ids(self):
         return set(self.original_prompt.keys()).union(set(self.ephemeral_prompt.keys()))
+
+    @property
+    def nodes(self):
+        return self.all_node_ids()
 
     def get_original_prompt(self):
         return self.original_prompt
@@ -123,6 +139,7 @@ class TopologicalSort:
         self.externalBlocks = 0
         self.externalBlockResults = {}
         self.unblockedEvent = asyncio.Event()
+        self.staged_node_ids = set()
 
     def get_input_info(self, unique_id, input_name):
         node = self.dynprompt.get_node(unique_id)
@@ -202,7 +219,11 @@ class TopologicalSort:
         return False
 
     def get_ready_nodes(self):
-        return [node_id for node_id in self.pendingNodes if self.blockCount[node_id] == 0]
+        staged = getattr(self, "staged_node_ids", None)
+        if staged is None:
+            staged_id = getattr(self, "staged_node_id", None)
+            staged = {staged_id} if staged_id is not None else set()
+        return [node_id for node_id in self.pendingNodes if self.blockCount[node_id] == 0 and node_id not in staged]
 
     def pop_node(self, unique_id):
         del self.pendingNodes[unique_id]
@@ -263,11 +284,49 @@ class ExecutionList(TopologicalSort):
         super().add_strong_link(from_node_id, from_socket, to_node_id)
         self.cache_link(from_node_id, to_node_id, from_socket)
 
+    def get_class_type(self, node_id):
+        if self.dynprompt.has_node(node_id):
+            return self.dynprompt.get_node(node_id).get("class_type", "")
+        return ""
+
+    def stage_node(self, node_id):
+        if not hasattr(self, "staged_node_ids"):
+            self.staged_node_ids = set()
+        self.staged_node_ids.add(node_id)
+        self.staged_node_id = node_id
+
+    def unstage_node(self, node_id):
+        if hasattr(self, "staged_node_ids"):
+            self.staged_node_ids.discard(node_id)
+            if getattr(self, "staged_node_id", None) == node_id:
+                self.staged_node_id = next(iter(self.staged_node_ids), None) if self.staged_node_ids else None
+        else:
+            if getattr(self, "staged_node_id", None) == node_id:
+                self.staged_node_id = None
+
+    def complete_node(self, node_id):
+        if hasattr(self, "staged_node_ids"):
+            self.staged_node_ids.discard(node_id)
+            if getattr(self, "staged_node_id", None) == node_id:
+                self.staged_node_id = next(iter(self.staged_node_ids), None) if self.staged_node_ids else None
+        else:
+            if getattr(self, "staged_node_id", None) == node_id:
+                self.staged_node_id = None
+        if node_id in self.pendingNodes:
+            self.pop_node(node_id)
+            self.execution_cache.pop(node_id, None)
+            self.execution_cache_listeners.pop(node_id, None)
+
     def inhibit_nodes(self, node_ids):
         """Remove pending nodes selected by the currently executing control node."""
-        assert self.staged_node_id is not None, "Nodes may only be inhibited while a control node is staged"
+        staged = getattr(self, "staged_node_ids", None)
+        if staged is None:
+            staged_id = getattr(self, "staged_node_id", None)
+            staged = {staged_id} if staged_id is not None else set()
+        staged_id = getattr(self, "staged_node_id", None)
+        assert staged_id is not None or len(staged) > 0, "Nodes may only be inhibited while a control node is staged"
         node_ids = set(node_ids).intersection(self.pendingNodes)
-        assert self.staged_node_id not in node_ids, "A control node cannot inhibit itself"
+        assert (staged_id not in node_ids) and not staged.intersection(node_ids), "A control node cannot inhibit itself"
 
         for from_node_id, blocked_nodes in self.blocking.items():
             if from_node_id not in node_ids:
@@ -282,6 +341,8 @@ class ExecutionList(TopologicalSort):
             del self.blocking[node_id]
             self.execution_cache.pop(node_id, None)
             self.execution_cache_listeners.pop(node_id, None)
+            if hasattr(self, "staged_node_ids"):
+                self.staged_node_ids.discard(node_id)
         for listeners in self.execution_cache_listeners.values():
             listeners.difference_update({listener for listener in listeners if listener[0] in node_ids})
 
@@ -316,6 +377,9 @@ class ExecutionList(TopologicalSort):
             return None, error_details, ex
 
         self.staged_node_id = self.ux_friendly_pick_node(available)
+        if not hasattr(self, "staged_node_ids"):
+            self.staged_node_ids = set()
+        self.staged_node_ids.add(self.staged_node_id)
         return self.staged_node_id, None, None
 
     def ux_friendly_pick_node(self, node_list):
@@ -357,20 +421,22 @@ class ExecutionList(TopologicalSort):
         #TODO: this function should be improved
         return node_list[0]
 
-    def unstage_node_execution(self):
-        assert self.staged_node_id is not None
-        self.staged_node_id = None
+    def unstage_node_execution(self, node_id=None):
+        if node_id is None:
+            node_id = self.staged_node_id
+        assert node_id is not None
+        self.unstage_node(node_id)
 
-    def is_staged_node_blocked(self):
-        assert self.staged_node_id is not None
-        return self.blockCount[self.staged_node_id] > 0
+    def is_staged_node_blocked(self, node_id=None):
+        target = node_id if node_id is not None else getattr(self, "staged_node_id", None)
+        assert target is not None
+        return self.blockCount[target] > 0
 
-    def complete_node_execution(self):
-        node_id = self.staged_node_id
-        self.pop_node(node_id)
-        self.execution_cache.pop(node_id, None)
-        self.execution_cache_listeners.pop(node_id, None)
-        self.staged_node_id = None
+    def complete_node_execution(self, node_id=None):
+        if node_id is None:
+            node_id = self.staged_node_id
+        if node_id is not None:
+            self.complete_node(node_id)
 
     def get_nodes_in_cycle(self):
         # We'll dissolve the graph in reverse topological order to leave only the nodes in the cycle.

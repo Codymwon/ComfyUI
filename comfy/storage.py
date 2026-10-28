@@ -109,3 +109,12 @@ def model_fast_disk(paths):
         fast = bool(results) and all(result is True for result in results)
     logging.info("Model storage policy: fast_disk=%s paths=%s", fast, [os.path.realpath(path) for path in paths])
     return fast
+
+
+def __getattr__(name):
+    if name == "ContentAddressedDiskCache":
+        from comfy_execution.caching import ContentAddressedDiskCache
+        return ContentAddressedDiskCache
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+

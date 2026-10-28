@@ -2,6 +2,7 @@ import copy
 import heapq
 import inspect
 import logging
+import os
 import sys
 import threading
 import time
@@ -38,7 +39,12 @@ from comfy_execution.graph import (
     ExecutionBlocker,
     ExecutionList,
     get_input_info,
+    ResourceClass,
+    classify_node_resource,
+    DependencyCycleError,
 )
+import contextvars
+CONCURRENT_EXECUTION_ENABLED = contextvars.ContextVar("CONCURRENT_EXECUTION_ENABLED", default=False)
 from comfy_execution.graph_utils import GraphBuilder, is_link
 from comfy_execution.validation import LoopValidationError, validate_loops, validate_node_input
 from comfy_execution.progress import get_progress_state, reset_progress_state, add_progress_handler, WebUIProgressHandler
@@ -311,8 +317,14 @@ async def _async_map_node_over_list(prompt_id, unique_id, obj, input_data_all, f
                 else:
                     results.append(task)
             else:
-                with CurrentNodeContext(prompt_id, unique_id, index):
-                    result = f(**inputs)
+                if CONCURRENT_EXECUTION_ENABLED.get(False):
+                    def _run_sync(p_id, u_id, idx, fn, inps):
+                        with CurrentNodeContext(p_id, u_id, idx):
+                            return fn(**inps)
+                    result = await asyncio.to_thread(_run_sync, prompt_id, unique_id, index, f, inputs)
+                else:
+                    with CurrentNodeContext(prompt_id, unique_id, index):
+                        result = f(**inputs)
                 results.append(result)
         else:
             results.append(execution_block)
@@ -663,13 +675,73 @@ async def execute(server: "ExecutionServer", dynprompt, caches, current_item, ex
 
     return (ExecutionResult.SUCCESS, None, None)
 
+
+async def execute_ready_nodes(execution_list, prompt_server=None, execute_single_node=None):
+    ready_nodes = execution_list.get_ready_nodes()
+
+    cpu_tasks = []
+    gpu_node = None
+
+    for node_id in ready_nodes:
+        node_class = execution_list.get_class_type(node_id)
+        if classify_node_resource(node_class) == ResourceClass.CPU_IO_CONCURRENT:
+            cpu_tasks.append(node_id)
+        elif gpu_node is None:
+            gpu_node = node_id
+
+    if execute_single_node is None:
+        if hasattr(prompt_server, "execute_single_node"):
+            execute_single_node = prompt_server.execute_single_node
+        elif hasattr(prompt_server, "execute_node"):
+            execute_single_node = prompt_server.execute_node
+        else:
+            raise ValueError("execute_single_node callable must be provided or defined on prompt_server")
+
+    coros = []
+    for nid in cpu_tasks:
+        if inspect.iscoroutinefunction(execute_single_node):
+            coros.append(execute_single_node(nid))
+        else:
+            coros.append(asyncio.to_thread(execute_single_node, nid))
+
+    if gpu_node:
+        gpu_mutex = getattr(prompt_server, "gpu_mutex", None)
+        if gpu_mutex is None:
+            if not hasattr(prompt_server, "_gpu_mutex"):
+                if prompt_server is not None:
+                    prompt_server._gpu_mutex = asyncio.Lock()
+                    gpu_mutex = prompt_server._gpu_mutex
+                else:
+                    gpu_mutex = asyncio.Lock()
+            else:
+                gpu_mutex = prompt_server._gpu_mutex
+
+        async def _exec_gpu():
+            async with gpu_mutex:
+                if inspect.iscoroutinefunction(execute_single_node):
+                    return await execute_single_node(gpu_node)
+                else:
+                    return await asyncio.to_thread(execute_single_node, gpu_node)
+
+        coros.append(_exec_gpu())
+
+    if coros:
+        results = await asyncio.gather(*coros)
+    else:
+        results = []
+    return list(results)
+
+
 class PromptExecutor:
-    def __init__(self, server: "ExecutionServer", cache_type=False, cache_args=None, asset_manager: AssetManager | None = None):
+    def __init__(self, server: "ExecutionServer", cache_type=False, cache_args=None, asset_manager: AssetManager | None = None, concurrent_execution=None):
         self.cache_args = cache_args
         self.cache_type = cache_type
         self.server = server
         self.asset_manager = asset_manager if asset_manager is not None else NoAssets(args)
         self.prompt_model_tracker = comfy.model_patcher.PromptModelTracker()
+        if concurrent_execution is None:
+            concurrent_execution = getattr(args, "enable_concurrent_execution", False) or os.environ.get("COMFY_CONCURRENT_EXECUTION", "0") == "1"
+        self.concurrent_execution = concurrent_execution
         self.reset()
 
     def reset(self):
@@ -784,39 +856,136 @@ class PromptExecutor:
                 for node_id in list(execute_outputs):
                     execution_list.add_node(node_id)
 
-                while not execution_list.is_empty():
-                    node_id, error, ex = await execution_list.stage_node_execution()
-                    if error is not None:
-                        self.success = False
-                        self.handle_execution_error(prompt_id, dynamic_prompt.original_prompt, current_outputs, executed, error, ex)
-                        break
+                if self.concurrent_execution:
+                    CONCURRENT_EXECUTION_ENABLED.set(True)
+                    gpu_mutex = getattr(self.server, "gpu_mutex", None)
+                    if gpu_mutex is None:
+                        if not hasattr(self, "_gpu_mutex"):
+                            self._gpu_mutex = asyncio.Lock()
+                        gpu_mutex = self._gpu_mutex
 
-                    assert node_id is not None, "Node ID should not be None at this point"
-                    result, error, ex = await execute(self.server, dynamic_prompt, self.caches, node_id, extra_data, executed, prompt_id, execution_list, pending_subgraph_results, pending_async_nodes, ui_node_outputs, self.asset_manager)
-                    self.success = result != ExecutionResult.FAILURE
-                    if result == ExecutionResult.FAILURE:
-                        self.handle_execution_error(prompt_id, dynamic_prompt.original_prompt, current_outputs, executed, error, ex)
-                        break
-                    elif result == ExecutionResult.PENDING:
-                        execution_list.unstage_node_execution()
-                    else: # result == ExecutionResult.SUCCESS:
-                        execution_list.complete_node_execution()
+                    while not execution_list.is_empty():
+                        ready_nodes = execution_list.get_ready_nodes()
+                        while len(ready_nodes) == 0 and execution_list.externalBlocks > 0:
+                            await execution_list.unblockedEvent.wait()
+                            execution_list.unblockedEvent.clear()
+                            ready_nodes = execution_list.get_ready_nodes()
 
-                    if self.cache_type == CacheType.RAM_PRESSURE:
-                        ram_release_callback(ram_inactive_headroom)
-                        ram_shortfall = ram_headroom - comfy.system_memory.virtual_memory_available()
-                        if ram_shortfall > 0:
-                            freed = ram_release_callback(ram_headroom, free_active=True, min_entry_size=RAM_CACHE_LARGE_INTERMEDIATE)
-                            ram_shortfall -= freed
-                        if comfy.model_management.should_free_pins_for_ram_pressure(ram_shortfall):
-                            freed = comfy.model_management.free_pins(ram_shortfall + 512 * (1024 ** 2))
-                            if freed < ram_shortfall:
-                                if freed > 64 * (1024 ** 2):
-                                    # AIMDO MEM_DECOMMIT can outrun psutil.available catching up.
-                                    time.sleep(0.05)
-                                ram_release_callback(ram_headroom, free_active=True)
+                        if len(ready_nodes) == 0:
+                            cycled_nodes = execution_list.get_nodes_in_cycle()
+                            blamed_node = cycled_nodes[0] if cycled_nodes else None
+                            for nid in cycled_nodes:
+                                display_node_id = dynamic_prompt.get_display_node_id(nid)
+                                if display_node_id != nid:
+                                    blamed_node = display_node_id
+                                    break
+                            ex = DependencyCycleError("Dependency cycle detected")
+                            error_details = {
+                                "node_id": blamed_node,
+                                "exception_message": str(ex),
+                                "exception_type": "graph.DependencyCycleError",
+                                "traceback": [],
+                                "current_inputs": []
+                            }
+                            self.success = False
+                            self.handle_execution_error(prompt_id, dynamic_prompt.original_prompt, current_outputs, executed, error_details, ex)
+                            break
+
+                        cpu_tasks = []
+                        gpu_node = None
+                        for nid in ready_nodes:
+                            node_class = execution_list.get_class_type(nid)
+                            if classify_node_resource(node_class) == ResourceClass.CPU_IO_CONCURRENT:
+                                cpu_tasks.append(nid)
+                            elif gpu_node is None:
+                                gpu_node = nid
+
+                        async def _exec_node(nid):
+                            execution_list.stage_node(nid)
+                            try:
+                                res, err, exception = await execute(
+                                    self.server, dynamic_prompt, self.caches, nid, extra_data,
+                                    executed, prompt_id, execution_list, pending_subgraph_results,
+                                    pending_async_nodes, ui_node_outputs, self.asset_manager
+                                )
+                                if res == ExecutionResult.FAILURE:
+                                    execution_list.unstage_node(nid)
+                                    return (res, err, exception)
+                                elif res == ExecutionResult.PENDING:
+                                    execution_list.unstage_node(nid)
+                                    return (res, None, None)
+                                else:
+                                    execution_list.complete_node(nid)
+                                    return (res, None, None)
+                            except Exception as ex:
+                                execution_list.unstage_node(nid)
+                                return (ExecutionResult.FAILURE, {"exception_message": str(ex)}, ex)
+
+                        dispatch_coros = [_exec_node(nid) for nid in cpu_tasks]
+                        if gpu_node:
+                            async def _exec_gpu_task():
+                                async with gpu_mutex:
+                                    return await _exec_node(gpu_node)
+                            dispatch_coros.append(_exec_gpu_task())
+
+                        failed = False
+                        if dispatch_coros:
+                            batch_results = await asyncio.gather(*dispatch_coros)
+                            for res, err, exception in batch_results:
+                                if res == ExecutionResult.FAILURE:
+                                    self.success = False
+                                    self.handle_execution_error(prompt_id, dynamic_prompt.original_prompt, current_outputs, executed, err, exception)
+                                    failed = True
+                                    break
+                        if failed:
+                            break
+
+                        if self.cache_type == CacheType.RAM_PRESSURE:
+                            ram_release_callback(ram_inactive_headroom)
+                            ram_shortfall = ram_headroom - comfy.system_memory.virtual_memory_available()
+                            if ram_shortfall > 0:
+                                freed = ram_release_callback(ram_headroom, free_active=True, min_entry_size=RAM_CACHE_LARGE_INTERMEDIATE)
+                                ram_shortfall -= freed
+                            if comfy.model_management.should_free_pins_for_ram_pressure(ram_shortfall):
+                                freed = comfy.model_management.free_pins(ram_shortfall + 512 * (1024 ** 2))
+                                if freed < ram_shortfall:
+                                    if freed > 64 * (1024 ** 2):
+                                        time.sleep(0.05)
+                                    ram_release_callback(ram_headroom, free_active=True)
                 else:
-                    # Only execute when the while-loop ends without break
+                    while not execution_list.is_empty():
+                        node_id, error, ex = await execution_list.stage_node_execution()
+                        if error is not None:
+                            self.success = False
+                            self.handle_execution_error(prompt_id, dynamic_prompt.original_prompt, current_outputs, executed, error, ex)
+                            break
+
+                        assert node_id is not None, "Node ID should not be None at this point"
+                        result, error, ex = await execute(self.server, dynamic_prompt, self.caches, node_id, extra_data, executed, prompt_id, execution_list, pending_subgraph_results, pending_async_nodes, ui_node_outputs, self.asset_manager)
+                        self.success = result != ExecutionResult.FAILURE
+                        if result == ExecutionResult.FAILURE:
+                            self.handle_execution_error(prompt_id, dynamic_prompt.original_prompt, current_outputs, executed, error, ex)
+                            break
+                        elif result == ExecutionResult.PENDING:
+                            execution_list.unstage_node_execution()
+                        else: # result == ExecutionResult.SUCCESS:
+                            execution_list.complete_node_execution()
+
+                        if self.cache_type == CacheType.RAM_PRESSURE:
+                            ram_release_callback(ram_inactive_headroom)
+                            ram_shortfall = ram_headroom - comfy.system_memory.virtual_memory_available()
+                            if ram_shortfall > 0:
+                                freed = ram_release_callback(ram_headroom, free_active=True, min_entry_size=RAM_CACHE_LARGE_INTERMEDIATE)
+                                ram_shortfall -= freed
+                            if comfy.model_management.should_free_pins_for_ram_pressure(ram_shortfall):
+                                freed = comfy.model_management.free_pins(ram_shortfall + 512 * (1024 ** 2))
+                                if freed < ram_shortfall:
+                                    if freed > 64 * (1024 ** 2):
+                                        # AIMDO MEM_DECOMMIT can outrun psutil.available catching up.
+                                        time.sleep(0.05)
+                                    ram_release_callback(ram_headroom, free_active=True)
+
+                if self.success:
                     # Send cached UI for intermediate output nodes that weren't executed
                     for node_id in dynamic_prompt.all_node_ids():
                         if node_id in executed:
@@ -843,6 +1012,7 @@ class PromptExecutor:
                     comfy.model_management.unload_all_models()
         finally:
             comfy.model_management.cancellation_manager.unregister_prompt(prompt_id)
+            CONCURRENT_EXECUTION_ENABLED.set(False)
             if self.cache_type == CacheType.RAM_PRESSURE:
                 detail("RAM cache evictions: prompt=%s active=%s full=%s", prompt_id, self.caches.outputs.active_evictions, self.caches.outputs.full_evictions)
             comfy.memory_management.set_ram_cache_release_state(None, 0)

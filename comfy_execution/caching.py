@@ -1,10 +1,14 @@
 import asyncio
 import bisect
+import hashlib
 import itertools
+import json
 import logging
+import os
 import time
 import torch
 from typing import Sequence, Mapping, Dict
+import comfy.utils
 from comfy.model_patcher import is_model_patcher_output
 from comfy.system_memory import virtual_memory_available
 from comfy_execution.graph import DynamicPrompt
@@ -130,12 +134,21 @@ class CacheKeySetInputSignature(CacheKeySet):
     # This function returns a list of all ancestors of the given node. The order of the list is
     # deterministic based on which specific inputs the ancestor is connected by.
     def get_ordered_ancestry(self, dynprompt, node_id):
+        memo = getattr(self, "_ancestry_memo", None)
+        if memo is None:
+            memo = {}
+            self._ancestry_memo = memo
+        if node_id in memo:
+            return memo[node_id]
+
         ancestors = []
         order_mapping = {}
         self.get_ordered_ancestry_internal(dynprompt, node_id, ancestors, order_mapping)
+        memo[node_id] = (ancestors, order_mapping)
         return ancestors, order_mapping
 
-    def get_ordered_ancestry_internal(self, dynprompt, node_id, ancestors, order_mapping):
+    @staticmethod
+    def get_ordered_ancestry_internal(dynprompt, node_id, ancestors, order_mapping):
         if not dynprompt.has_node(node_id):
             return
         inputs = dynprompt.get_node(node_id)["inputs"]
@@ -146,10 +159,10 @@ class CacheKeySetInputSignature(CacheKeySet):
                 if ancestor_id not in order_mapping:
                     ancestors.append(ancestor_id)
                     order_mapping[ancestor_id] = len(ancestors) - 1
-                    self.get_ordered_ancestry_internal(dynprompt, ancestor_id, ancestors, order_mapping)
+                    CacheKeySetInputSignature.get_ordered_ancestry_internal(dynprompt, ancestor_id, ancestors, order_mapping)
 
 class BasicCache:
-    def __init__(self, key_class, enable_providers=False):
+    def __init__(self, key_class=CacheKeySetInputSignature, enable_providers=False):
         self.key_class = key_class
         self.initialized = False
         self.enable_providers = enable_providers
@@ -159,8 +172,25 @@ class BasicCache:
         self.subcaches = {}
         self._pending_store_tasks: set = set()
 
+    def get_ordered_ancestry(self, dynprompt, node_id):
+        if hasattr(self, "cache_key_set") and hasattr(self.cache_key_set, "get_ordered_ancestry"):
+            return self.cache_key_set.get_ordered_ancestry(dynprompt, node_id)
+        memo = getattr(self, "_ancestry_memo", None)
+        if memo is None:
+            memo = {}
+            self._ancestry_memo = memo
+        if node_id in memo:
+            return memo[node_id]
+
+        ancestors = []
+        order_mapping = {}
+        CacheKeySetInputSignature.get_ordered_ancestry_internal(dynprompt, node_id, ancestors, order_mapping)
+        memo[node_id] = (ancestors, order_mapping)
+        return ancestors, order_mapping
+
     async def set_prompt(self, dynprompt, node_ids, is_changed_cache):
         self.dynprompt = dynprompt
+        self._ancestry_memo = {}
         self.cache_key_set = self.key_class(dynprompt, node_ids, is_changed_cache)
         await self.cache_key_set.add_keys(node_ids)
         self.is_changed_cache = is_changed_cache
@@ -618,3 +648,32 @@ class RAMPressureCache(LRUCache):
             if min_entry_size == 0:
                 self.full_evictions = True
         return freed
+
+
+class ContentAddressedDiskCache:
+    def __init__(self, cache_dir):
+        self.cache_dir = cache_dir
+        os.makedirs(cache_dir, exist_ok=True)
+
+    def get_cache_key(self, class_type, inputs, model_hash=""):
+        payload = f"{class_type}:{json.dumps(inputs, sort_keys=True, default=str)}:{model_hash}"
+        return hashlib.sha256(payload.encode()).hexdigest()
+
+    def load_intermediate(self, key):
+        path = os.path.join(self.cache_dir, f"{key}.safetensors")
+        if os.path.exists(path):
+            return comfy.utils.load_torch_file(path, safe_load=True)
+        return None
+
+    def store_intermediate(self, key, tensors_dict):
+        path = os.path.join(self.cache_dir, f"{key}.safetensors")
+        prepared = {}
+        for k, v in tensors_dict.items():
+            if isinstance(v, torch.Tensor):
+                prepared[k] = v.detach().cpu().contiguous()
+            else:
+                prepared[k] = v
+        temp_path = f"{path}.tmp.{os.getpid()}"
+        comfy.utils.save_torch_file(prepared, temp_path)
+        os.replace(temp_path, path)
+
