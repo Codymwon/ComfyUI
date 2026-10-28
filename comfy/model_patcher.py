@@ -48,6 +48,55 @@ from comfy.patcher_extension import CallbacksMP, PatcherInjection, WrappersMP
 
 import comfy_aimdo.model_vbar
 
+class TeaCacheState:
+    def __init__(self, threshold=0.3):
+        self.threshold = threshold
+        self.previous_residual = None
+        self.previous_modulated_input = None
+        self.accumulated_rel_l1 = 0.0
+
+    def reset(self):
+        self.previous_residual = None
+        self.previous_modulated_input = None
+        self.accumulated_rel_l1 = 0.0
+
+    def should_skip_step(self, current_modulated_input):
+        if (self.previous_modulated_input is None or
+            self.previous_modulated_input.device != current_modulated_input.device or
+            self.previous_modulated_input.shape != current_modulated_input.shape):
+            self.previous_modulated_input = current_modulated_input.clone()
+            self.accumulated_rel_l1 = 0.0
+            return False
+
+        # Calculate relative L1 distance
+        l1_diff = torch.abs(current_modulated_input - self.previous_modulated_input).mean()
+        l1_base = torch.abs(self.previous_modulated_input).mean()
+        rel_l1 = (l1_diff / (l1_base + 1e-8)).item()
+        self.accumulated_rel_l1 += rel_l1
+
+        if self.accumulated_rel_l1 < self.threshold:
+            return True
+        else:
+            self.previous_modulated_input = current_modulated_input.clone()
+            self.accumulated_rel_l1 = 0.0
+            return False
+
+def is_same_device(d1, d2):
+    if d1 is None or d2 is None:
+        return False
+    try:
+        d1 = torch.device(d1)
+        d2 = torch.device(d2)
+    except Exception:
+        return False
+    if d1.type != d2.type:
+        return False
+    if d1.type in ("cuda", "xpu", "npu"):
+        idx1 = d1.index if d1.index is not None else 0
+        idx2 = d2.index if d2.index is not None else 0
+        return idx1 == idx2
+    return d1.index == d2.index
+
 def is_model_patcher_output(output):
     return isinstance(output, ModelPatcher) or isinstance(getattr(output, "patcher", None), ModelPatcher)
 
@@ -657,6 +706,12 @@ class ModelPatcher:
     def set_model_sampler_calc_cond_batch_function(self, sampler_calc_cond_batch_function):
         self.model_options["sampler_calc_cond_batch_function"] = sampler_calc_cond_batch_function
 
+    def set_model_teacache(self, threshold=0.3):
+        state = TeaCacheState(threshold=threshold)
+        self.model_options["teacache"] = state
+        self.model_options.setdefault("transformer_options", {})["teacache"] = state
+        return state
+
     def set_model_unet_function_wrapper(self, unet_wrapper_function: UnetWrapperFunction):
         self.model_options["model_function_wrapper"] = unet_wrapper_function
 
@@ -1180,6 +1235,14 @@ class ModelPatcher:
                 self.model.device = device_to
             self.model.model_loaded_weight_memory = 0
             self.model.model_offload_buffer_memory = 0
+            if hasattr(self.model, "_batch_schedule_cache"):
+                self.model._batch_schedule_cache = None
+            if hasattr(self.model, "_batch_schedule_cache_step"):
+                self.model._batch_schedule_cache_step = None
+            if hasattr(self.model, "_batch_schedule_cache_multigpu"):
+                self.model._batch_schedule_cache_multigpu = None
+            if hasattr(self.model, "_batch_schedule_cache_multigpu_step"):
+                self.model._batch_schedule_cache_multigpu_step = None
 
             for m in self.model.modules():
                 if hasattr(m, "comfy_patched_weights"):
@@ -1276,10 +1339,61 @@ class ModelPatcher:
             logging.info("Unloaded partially: {:.2f} MB freed, {:.2f} MB remains loaded, {:.2f} MB buffer reserved, lowvram patches: {}".format(memory_freed / (1024 * 1024), self.model.model_loaded_weight_memory / (1024 * 1024), offload_buffer / (1024 * 1024), self.model.lowvram_patch_counter))
             return memory_freed
 
+    def is_model_resident_on_device(self, device_to):
+        if device_to is None:
+            return False
+        if getattr(self.model, "model_lowvram", False):
+            return False
+        model_device = getattr(self.model, "device", None)
+        try:
+            target_device = torch.device(device_to)
+            if model_device is not None and not comfy.model_management.is_device_cpu(model_device):
+                if not is_same_device(model_device, target_device):
+                    return False
+            first_param = next(self.model.parameters())
+            return is_same_device(first_param.device, target_device)
+        except Exception:
+            return False
+
+    def patch_weight_deltas_inplace(self, device_to=None):
+        if device_to is None:
+            device_to = getattr(self.model, "device", None)
+        target_device = torch.device(device_to)
+
+        # 1. Unpatch weights currently in backup, keeping resident parameters on target_device
+        keys = list(self.backup.keys())
+        for k in keys:
+            bk = self.backup[k]
+            weight, set_func, _ = get_key_weight(self.model, k)
+            if set_func is not None:
+                set_func(bk.weight, inplace_update=True)
+            elif weight is not None and is_same_device(weight.device, target_device) and weight.shape == bk.weight.shape:
+                comfy.utils.copy_to_param(self.model, k, bk.weight)
+            else:
+                comfy.utils.set_attr_param(self.model, k, bk.weight.to(device=target_device, copy=False))
+            if k not in self.patches:
+                self.backup.pop(k)
+
+        # 2. Patch newly active or updated weights directly on target device
+        for key in self.patches:
+            self.patch_weight_to_device(key, device_to=target_device, inplace_update=True)
+
+        if comfy.model_management.is_device_cuda(target_device):
+            torch.cuda.synchronize(target_device)
+
+        self.model.current_weight_patches_uuid = self.patches_uuid
+
     def partially_load(self, device_to, extra_memory=0, force_patch_weights=False):
         with self.use_ejected(skip_and_inject_on_exit_only=True):
-            unpatch_weights = self.model.current_weight_patches_uuid is not None and (self.model.current_weight_patches_uuid != self.patches_uuid or force_patch_weights)
-            # TODO: force_patch_weights should not unload + reload full model
+            needs_weight_patch = (self.model.current_weight_patches_uuid != self.patches_uuid or force_patch_weights)
+            # In-place LoRA weight delta updates when base weights are resident on target device
+            if needs_weight_patch and extra_memory >= 0 and self.is_model_resident_on_device(device_to):
+                self.patch_weight_deltas_inplace(device_to)
+                self.patch_model(load_weights=False)
+                self.apply_hooks(self.forced_hooks, force_apply=True)
+                return 0
+
+            unpatch_weights = self.model.current_weight_patches_uuid is not None and needs_weight_patch
             used = self.model.model_loaded_weight_memory
             self.unpatch_model(self.offload_device, unpatch_weights=unpatch_weights)
             if unpatch_weights:
@@ -1336,6 +1450,17 @@ class ModelPatcher:
         self.clean_hooks()
         if hasattr(self.model, "current_patcher"):
             self.model.current_patcher = None
+        if hasattr(self.model, "_batch_schedule_cache"):
+            self.model._batch_schedule_cache = None
+        if hasattr(self.model, "_batch_schedule_cache_step"):
+            self.model._batch_schedule_cache_step = None
+        if hasattr(self.model, "_batch_schedule_cache_multigpu"):
+            self.model._batch_schedule_cache_multigpu = None
+        if hasattr(self.model, "_batch_schedule_cache_multigpu_step"):
+            self.model._batch_schedule_cache_multigpu_step = None
+        tc = self.model_options.get("teacache") or self.model_options.get("transformer_options", {}).get("teacache")
+        if tc is not None and hasattr(tc, "reset"):
+            tc.reset()
         for callback in self.get_all_callbacks(CallbacksMP.ON_CLEANUP):
             callback(self)
 
